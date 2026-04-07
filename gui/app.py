@@ -513,7 +513,7 @@ class BatchFusionWorker(QThread):
     """Worker thread for batch processing multiple folders/files."""
 
     progress = pyqtSignal(str)
-    item_started = pyqtSignal(int, int, str)  # (current_index, total, folder_name)
+    item_started = pyqtSignal(int, int, str)  # (current_index, total, item_name)
     item_finished = pyqtSignal(int, int)  # (current_index, total) for progress bar
     finished = pyqtSignal(int, int, float)  # (succeeded, failed, total_time)
     error = pyqtSignal(str)
@@ -541,6 +541,14 @@ class BatchFusionWorker(QThread):
         self.progress.emit(f"[{index + 1}/{total} {name}] {message}")
 
     def run(self):
+        try:
+            self._run_batch()
+        except Exception as e:
+            import traceback
+
+            self.error.emit(f"Batch processing failed: {e}\n{traceback.format_exc()}")
+
+    def _run_batch(self):
         import time
 
         total = len(self.paths)
@@ -568,12 +576,17 @@ class BatchFusionWorker(QThread):
                     log_fn=log_fn,
                 )
                 succeeded += 1
+            except MemoryError:
+                failed += 1
+                self._log(idx, total, name, "FAILED: Out of memory. Stopping batch.")
+                self.item_finished.emit(idx, total)
+                break
             except Exception as e:
                 import traceback
 
                 failed += 1
                 self._log(idx, total, name, f"FAILED: {e}")
-                self.progress.emit(traceback.format_exc())
+                self._log(idx, total, name, traceback.format_exc())
 
             self.item_finished.emit(idx, total)
 
@@ -585,7 +598,7 @@ class DropArea(QFrame):
     """Drag and drop area for files or folders. Supports single and multi-drop."""
 
     fileDropped = pyqtSignal(str)
-    filesDropped = pyqtSignal(list)  # list of validated path strings
+    filesDropped = pyqtSignal(list)  # list of path strings (directories or .tif/.tiff files)
     _default_style = "border: 2px dashed #888; border-radius: 8px; background: #fafafa;"
     _hover_style = "border: 2px dashed #0071e3; border-radius: 8px; background: #e8f4ff;"
     _active_style = "border: 2px solid #34c759; border-radius: 8px; background: #f0fff4;"
@@ -693,9 +706,8 @@ class DropArea(QFrame):
             self.label.setText(path.name)
 
     def setFiles(self, paths, invalid_names=None):
-        """Set multiple validated paths (batch mode)."""
+        """Set multiple paths and update the display for batch mode."""
         self.file_paths = list(paths)
-        self.file_path = paths[0] if paths else None
         names = [Path(p).name for p in paths]
         label_lines = f"📦 {len(paths)} items selected:\n" + "\n".join(f"  {n}" for n in names)
         if invalid_names:
@@ -1246,8 +1258,8 @@ class StitcherGUI(QMainWindow):
         for p in paths:
             name = Path(p).name
             try:
-                tf_temp = TileFusion(p)
-                tf_temp.close()
+                with TileFusion(p):
+                    pass
                 valid_paths.append(p)
                 self.log(f"  ✓ {name}")
             except Exception as e:
@@ -1592,6 +1604,7 @@ class StitcherGUI(QMainWindow):
             darkfield=darkfield,
         )
         self.worker.progress.connect(self.log)
+        self.worker.error.connect(self.on_fusion_error)
         self.worker.item_started.connect(self._on_batch_item_started)
         self.worker.item_finished.connect(self._on_batch_item_finished)
         self.worker.finished.connect(self._on_batch_finished)
@@ -1609,6 +1622,9 @@ class StitcherGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 0)  # Reset to indeterminate for next run
         self.run_button.setEnabled(True)
+        self.preview_button.setEnabled(True)
+        self.calc_flatfield_button.setEnabled(True)
+        self.reg_zt_widget.setEnabled(True)
 
         minutes = int(total_time // 60)
         seconds = total_time % 60
