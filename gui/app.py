@@ -493,13 +493,182 @@ class FusionWorker(QThread):
             self.error.emit(f"Error: {str(e)}\n{traceback.format_exc()}")
 
 
+class BatchFusionWorker(QThread):
+    """Worker thread for batch processing multiple folders/files."""
+
+    progress = pyqtSignal(str)
+    item_started = pyqtSignal(int, int, str)  # (current_index, total, folder_name)
+    item_finished = pyqtSignal(int, int)  # (current_index, total) for progress bar
+    finished = pyqtSignal(int, int, float)  # (succeeded, failed, total_time)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        paths,
+        do_registration,
+        blend_pixels,
+        downsample_factor,
+        fusion_mode="blended",
+        flatfield=None,
+        darkfield=None,
+    ):
+        super().__init__()
+        self.paths = paths
+        self.do_registration = do_registration
+        self.blend_pixels = blend_pixels
+        self.downsample_factor = downsample_factor
+        self.fusion_mode = fusion_mode
+        self.flatfield = flatfield
+        self.darkfield = darkfield
+
+    def _log(self, index, total, name, message):
+        self.progress.emit(f"[{index + 1}/{total} {name}] {message}")
+
+    def run(self):
+        import time
+
+        total = len(self.paths)
+        succeeded = 0
+        failed = 0
+        batch_start = time.time()
+
+        for idx, tiff_path in enumerate(self.paths):
+            name = Path(tiff_path).name
+            self.item_started.emit(idx, total, name)
+
+            try:
+                self._process_one(idx, total, tiff_path)
+                succeeded += 1
+            except Exception as e:
+                import traceback
+
+                failed += 1
+                self._log(idx, total, name, f"FAILED: {e}")
+                self.progress.emit(traceback.format_exc())
+
+            self.item_finished.emit(idx, total)
+
+        total_time = time.time() - batch_start
+        self.finished.emit(succeeded, failed, total_time)
+
+    def _process_one(self, idx, total, tiff_path):
+        import gc
+        import json
+        import shutil
+        import time
+
+        import numpy as np
+        from tilefusion import TileFusion
+
+        name = Path(tiff_path).name
+
+        def log(msg):
+            self._log(idx, total, name, msg)
+
+        log("Loading...")
+
+        output_path = Path(tiff_path).parent / f"{Path(tiff_path).stem}_fused.ome.zarr"
+        output_folder = Path(tiff_path).parent / f"{Path(tiff_path).stem}_fused"
+
+        if output_path.exists():
+            shutil.rmtree(output_path)
+        if output_folder.exists():
+            shutil.rmtree(output_folder)
+
+        metrics_path = Path(tiff_path).parent / "metrics.json"
+        if metrics_path.exists():
+            metrics_path.unlink()
+        for m in Path(tiff_path).parent.glob("metrics_*.json"):
+            m.unlink()
+
+        step_start = time.time()
+        tf = TileFusion(
+            tiff_path,
+            output_path=output_path,
+            blend_pixels=self.blend_pixels,
+            downsample_factors=(self.downsample_factor, self.downsample_factor),
+            flatfield=self.flatfield,
+            darkfield=self.darkfield,
+        )
+        load_time = time.time() - step_start
+        log(f"Loaded {tf.n_tiles} tiles ({tf.Y}x{tf.X}) [{load_time:.1f}s]")
+
+        # Multi-region dataset
+        if len(tf._unique_regions) > 1:
+            log(f"Multi-region dataset: {tf._unique_regions}")
+            tf.stitch_all_regions()
+            return
+
+        # Registration
+        step_start = time.time()
+        if self.do_registration:
+            log("Computing registration...")
+            tf.refine_tile_positions_with_cross_correlation()
+            tf.save_pairwise_metrics(metrics_path)
+            reg_time = time.time() - step_start
+            log(f"Registration: {len(tf.pairwise_metrics)} pairs [{reg_time:.1f}s]")
+        else:
+            tf.threshold = 1.0
+            log("Using stage positions (no registration)")
+
+        # Optimize
+        step_start = time.time()
+        log("Optimizing positions...")
+        tf.optimize_shifts(
+            method="TWO_ROUND_ITERATIVE", rel_thresh=0.5, abs_thresh=2.0, iterative=True
+        )
+        gc.collect()
+
+        tf._tile_positions = [
+            tuple(np.array(pos) + off * np.array(tf.pixel_size))
+            for pos, off in zip(tf._tile_positions, tf.global_offsets)
+        ]
+        opt_time = time.time() - step_start
+        log(f"Positions optimized [{opt_time:.1f}s]")
+
+        # Fused space
+        step_start = time.time()
+        tf._compute_fused_image_space()
+        tf._pad_to_chunk_multiple()
+        log(f"Output size: {tf.padded_shape[0]} x {tf.padded_shape[1]}")
+
+        scale0 = output_path / "scale0" / "image"
+        scale0.parent.mkdir(parents=True, exist_ok=True)
+        tf._create_fused_tensorstore(output_path=scale0)
+
+        mode_label = "direct placement" if self.fusion_mode == "direct" else "blended"
+        log(f"Fusing tiles ({mode_label})...")
+        tf._fuse_tiles(mode=self.fusion_mode)
+        fuse_time = time.time() - step_start
+        log(f"Tiles fused [{fuse_time:.1f}s]")
+
+        # Metadata
+        ngff = {
+            "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "y", "x"]},
+            "zarr_format": 3,
+            "node_type": "group",
+        }
+        with open(output_path / "scale0" / "zarr.json", "w") as f:
+            json.dump(ngff, f, indent=2)
+
+        # Multiscales
+        step_start = time.time()
+        log("Building multiscale pyramid...")
+        tf._create_multiscales(output_path, factors=tf.multiscale_factors)
+        tf._generate_ngff_zarr3_json(output_path, resolution_multiples=tf.resolution_multiples)
+        pyramid_time = time.time() - step_start
+        log(f"Done [{pyramid_time:.1f}s]")
+
+
 class DropArea(QFrame):
-    """Drag and drop area for files or folders."""
+    """Drag and drop area for files or folders. Supports single and multi-drop."""
 
     fileDropped = pyqtSignal(str)
+    filesDropped = pyqtSignal(list)  # list of validated path strings
     _default_style = "border: 2px dashed #888; border-radius: 8px; background: #fafafa;"
     _hover_style = "border: 2px dashed #0071e3; border-radius: 8px; background: #e8f4ff;"
     _active_style = "border: 2px solid #34c759; border-radius: 8px; background: #f0fff4;"
+    _warn_style = "border: 2px solid #ff9500; border-radius: 8px; background: #fff8f0;"
 
     def __init__(self):
         super().__init__()
@@ -523,6 +692,7 @@ class DropArea(QFrame):
         layout.addWidget(self.label)
 
         self.file_path = None
+        self.file_paths = []  # All validated paths for batch mode
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -535,18 +705,36 @@ class DropArea(QFrame):
         else:
             self.setStyleSheet(self._default_style)
 
+    def _is_valid_path(self, file_path):
+        """Check if a path is a valid folder or TIFF file."""
+        path = Path(file_path)
+        return path.is_dir() or file_path.endswith((".tif", ".tiff"))
+
     def dropEvent(self, event: QDropEvent):
         urls = event.mimeData().urls()
-        if urls:
-            file_path = urls[0].toLocalFile()
-            path = Path(file_path)
-            if path.is_dir() or file_path.endswith((".tif", ".tiff")):
-                self.setFile(file_path)
-                self.fileDropped.emit(file_path)
-            else:
-                self.setStyleSheet(self._default_style)
-        else:
+        if not urls:
             self.setStyleSheet(self._default_style)
+            return
+
+        valid_paths = []
+        invalid_names = []
+        for url in urls:
+            file_path = url.toLocalFile()
+            if self._is_valid_path(file_path):
+                valid_paths.append(file_path)
+            else:
+                invalid_names.append(Path(file_path).name)
+
+        if not valid_paths:
+            self.setStyleSheet(self._default_style)
+            return
+
+        if len(valid_paths) == 1:
+            self.setFile(valid_paths[0])
+            self.fileDropped.emit(valid_paths[0])
+        else:
+            self.setFiles(valid_paths, invalid_names)
+            self.filesDropped.emit(valid_paths)
 
     def mousePressEvent(self, event):
         from PyQt5.QtWidgets import QMenu
@@ -572,6 +760,7 @@ class DropArea(QFrame):
 
     def setFile(self, file_path):
         self.file_path = file_path
+        self.file_paths = [file_path]
         path = Path(file_path)
         self.setStyleSheet(self._active_style)
         self.icon_label.setText("✅")
@@ -579,6 +768,20 @@ class DropArea(QFrame):
             self.label.setText(f"📁 {path.name}")
         else:
             self.label.setText(path.name)
+
+    def setFiles(self, paths, invalid_names=None):
+        """Set multiple validated paths (batch mode)."""
+        self.file_paths = list(paths)
+        self.file_path = paths[0] if paths else None
+        names = [Path(p).name for p in paths]
+        label_lines = f"📦 {len(paths)} items selected:\n" + "\n".join(f"  {n}" for n in names)
+        if invalid_names:
+            label_lines += f"\n⚠ Skipped: {', '.join(invalid_names)}"
+            self.setStyleSheet(self._warn_style)
+        else:
+            self.setStyleSheet(self._active_style)
+        self.icon_label.setText("✅")
+        self.label.setText(label_lines)
 
 
 class FlatfieldDropArea(QFrame):
@@ -731,6 +934,10 @@ class StitcherGUI(QMainWindow):
         self.regions = []  # List of region names for multi-region outputs
         self.is_multi_region = False
 
+        # Batch processing state
+        self.batch_paths = []  # Validated paths for batch mode
+        self.is_batch_mode = False
+
         # Flatfield correction state
         self.flatfield = None  # Shape (C, Y, X) or None
         self.darkfield = None  # Shape (C, Y, X) or None
@@ -754,6 +961,7 @@ class StitcherGUI(QMainWindow):
         # Input drop area (no wrapper group to avoid double border)
         self.drop_area = DropArea()
         self.drop_area.fileDropped.connect(self.on_file_dropped)
+        self.drop_area.filesDropped.connect(self.on_files_dropped)
         layout.addWidget(self.drop_area)
 
         # Preview section
@@ -1017,7 +1225,29 @@ class StitcherGUI(QMainWindow):
 
         layout.addStretch()
 
+    def _set_batch_mode(self, enabled):
+        """Enable/disable batch mode — grays out features that don't apply to batch."""
+        self.is_batch_mode = enabled
+        self.preview_button.setEnabled(not enabled)
+        self.calc_flatfield_button.setEnabled(not enabled and self.drop_area.file_path is not None)
+        self.reg_zt_widget.setEnabled(not enabled)
+        self.napari_button.setEnabled(False)
+        if enabled:
+            self.preview_button.setToolTip("Preview is not available in batch mode")
+            self.calc_flatfield_button.setToolTip(
+                "Calculate flatfield from a single dataset first, then load it for batch"
+            )
+            self.napari_button.setToolTip("Open individual outputs in Napari after batch completes")
+        else:
+            self.preview_button.setToolTip("")
+            self.calc_flatfield_button.setToolTip("")
+            self.napari_button.setToolTip("")
+
     def on_file_dropped(self, file_path):
+        """Handle single file/folder drop — exits batch mode."""
+        self._set_batch_mode(False)
+        self.batch_paths = []
+
         path = Path(file_path)
         if path.is_dir():
             self.log(f"Selected SQUID folder: {file_path}")
@@ -1077,6 +1307,53 @@ class StitcherGUI(QMainWindow):
             self.flatfield_drop_area.setFile(str(flatfield_path))
         else:
             self.flatfield_checkbox.setChecked(False)
+
+    def on_files_dropped(self, paths):
+        """Handle multi-drop — validate each path and enter batch mode."""
+        from tilefusion import TileFusion
+
+        self.log_text.clear()
+        self.log(f"Validating {len(paths)} dropped items...")
+
+        valid_paths = []
+        invalid_names = []
+        for p in paths:
+            name = Path(p).name
+            try:
+                tf_temp = TileFusion(p)
+                tf_temp.close()
+                valid_paths.append(p)
+                self.log(f"  ✓ {name}")
+            except Exception as e:
+                invalid_names.append(name)
+                self.log(f"  ✗ {name}: {e}")
+
+        if not valid_paths:
+            self.log("No valid datasets found.")
+            self.run_button.setEnabled(False)
+            return
+
+        # Update DropArea display with validation results
+        self.drop_area.setFiles(valid_paths, invalid_names)
+        self.batch_paths = valid_paths
+        self._set_batch_mode(True)
+        self.run_button.setEnabled(True)
+
+        # Clear single-dataset state
+        self.flatfield_status.setText("No flatfield")
+        self.flatfield_status.setStyleSheet("color: #86868b; font-size: 11px;")
+        self.dataset_n_z = 1
+        self.dataset_n_t = 1
+        self.dataset_n_channels = 1
+        self.dataset_channel_names = []
+
+        if invalid_names:
+            self.log(
+                f"\n{len(valid_paths)} of {len(paths)} valid. "
+                f"Skipped: {', '.join(invalid_names)}"
+            )
+        else:
+            self.log(f"\nAll {len(valid_paths)} items valid. Ready to run batch.")
 
     def on_registration_toggled(self, checked):
         self.downsample_widget.setVisible(checked)
@@ -1346,6 +1623,12 @@ class StitcherGUI(QMainWindow):
         flatfield = self.flatfield if self.flatfield_checkbox.isChecked() else None
         darkfield = self.darkfield if self.flatfield_checkbox.isChecked() else None
 
+        if self.is_batch_mode and len(self.batch_paths) > 1:
+            self._run_batch(blend_pixels, fusion_mode, flatfield, darkfield)
+        else:
+            self._run_single(blend_pixels, fusion_mode, flatfield, darkfield)
+
+    def _run_single(self, blend_pixels, fusion_mode, flatfield, darkfield):
         # Get registration z/t values (None means use default middle z)
         registration_z = self.reg_z_spin.value() if self.dataset_n_z > 1 else None
         registration_t = self.reg_t_spin.value() if self.dataset_n_t > 1 else 0
@@ -1369,6 +1652,48 @@ class StitcherGUI(QMainWindow):
         self.worker.finished.connect(self.on_fusion_finished)
         self.worker.error.connect(self.on_fusion_error)
         self.worker.start()
+
+    def _run_batch(self, blend_pixels, fusion_mode, flatfield, darkfield):
+        total = len(self.batch_paths)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(0)
+        self.log(f"Starting batch processing: {total} items\n")
+
+        self.worker = BatchFusionWorker(
+            self.batch_paths,
+            self.registration_checkbox.isChecked(),
+            blend_pixels,
+            self.downsample_spin.value(),
+            fusion_mode,
+            flatfield=flatfield,
+            darkfield=darkfield,
+        )
+        self.worker.progress.connect(self.log)
+        self.worker.item_started.connect(self._on_batch_item_started)
+        self.worker.item_finished.connect(self._on_batch_item_finished)
+        self.worker.finished.connect(self._on_batch_finished)
+        self.worker.start()
+
+    def _on_batch_item_started(self, index, total, name):
+        self.log(f"\n{'='*40}")
+        self.log(f"Processing {index + 1}/{total}: {name}")
+        self.log(f"{'='*40}")
+
+    def _on_batch_item_finished(self, index, total):
+        self.progress_bar.setValue(index + 1)
+
+    def _on_batch_finished(self, succeeded, failed, total_time):
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 0)  # Reset to indeterminate for next run
+        self.run_button.setEnabled(True)
+
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        time_str = f"{minutes}m {seconds:.1f}s" if minutes > 0 else f"{seconds:.1f}s"
+
+        self.log(f"\n{'='*40}")
+        self.log(f"Batch complete! {succeeded} succeeded, {failed} failed. Total time: {time_str}")
+        self.log(f"{'='*40}")
 
     def on_fusion_finished(self, output_path, elapsed_time):
         self.output_path = output_path
