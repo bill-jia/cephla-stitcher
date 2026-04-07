@@ -325,6 +325,127 @@ class PreviewWorker(QThread):
             self.error.emit(f"Error: {str(e)}\n{traceback.format_exc()}")
 
 
+def _run_fusion_pipeline(
+    tiff_path,
+    do_registration,
+    blend_pixels,
+    downsample_factor,
+    fusion_mode,
+    flatfield=None,
+    darkfield=None,
+    registration_z=None,
+    registration_t=0,
+    registration_channel=0,
+    log_fn=None,
+):
+    """Shared stitching pipeline used by both single and batch workers.
+
+    Returns the output path string. Raises on failure.
+    """
+    import gc
+    import json
+    import shutil
+    import time
+
+    import numpy as np
+    from tilefusion import TileFusion
+
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    p = Path(tiff_path)
+    output_path = p.parent / f"{p.stem}_fused.ome.zarr"
+    output_folder = p.parent / f"{p.stem}_fused"
+
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    if output_folder.exists():
+        shutil.rmtree(output_folder)
+
+    metrics_path = p.parent / "metrics.json"
+    if metrics_path.exists():
+        metrics_path.unlink()
+    for m in p.parent.glob("metrics_*.json"):
+        m.unlink()
+
+    step_start = time.time()
+    tf = TileFusion(
+        tiff_path,
+        output_path=output_path,
+        blend_pixels=blend_pixels,
+        downsample_factors=(downsample_factor, downsample_factor),
+        flatfield=flatfield,
+        darkfield=darkfield,
+        registration_z=registration_z,
+        registration_t=registration_t,
+        channel_to_use=registration_channel,
+    )
+    load_time = time.time() - step_start
+    log(f"Loaded {tf.n_tiles} tiles ({tf.Y}x{tf.X}) [{load_time:.1f}s]")
+
+    if len(tf._unique_regions) > 1:
+        log(f"Multi-region dataset: {tf._unique_regions}")
+        tf.stitch_all_regions()
+        return str(output_folder)
+
+    step_start = time.time()
+    if do_registration:
+        log("Computing registration...")
+        tf.refine_tile_positions_with_cross_correlation()
+        tf.save_pairwise_metrics(metrics_path)
+        reg_time = time.time() - step_start
+        log(f"Registration complete: {len(tf.pairwise_metrics)} pairs [{reg_time:.1f}s]")
+    else:
+        tf.threshold = 1.0
+        log("Using stage positions (no registration)")
+
+    step_start = time.time()
+    log("Optimizing positions...")
+    tf.optimize_shifts(method="TWO_ROUND_ITERATIVE", rel_thresh=0.5, abs_thresh=2.0, iterative=True)
+    gc.collect()
+
+    tf._tile_positions = [
+        tuple(np.array(pos) + off * np.array(tf.pixel_size))
+        for pos, off in zip(tf._tile_positions, tf.global_offsets)
+    ]
+    opt_time = time.time() - step_start
+    log(f"Positions optimized [{opt_time:.1f}s]")
+
+    step_start = time.time()
+    log("Computing fused image space...")
+    tf._compute_fused_image_space()
+    tf._pad_to_chunk_multiple()
+    log(f"Output size: {tf.padded_shape[0]} x {tf.padded_shape[1]}")
+
+    scale0 = output_path / "scale0" / "image"
+    scale0.parent.mkdir(parents=True, exist_ok=True)
+    tf._create_fused_tensorstore(output_path=scale0)
+
+    mode_label = "direct placement" if fusion_mode == "direct" else "blended"
+    log(f"Fusing tiles ({mode_label})...")
+    tf._fuse_tiles(mode=fusion_mode)
+    fuse_time = time.time() - step_start
+    log(f"Tiles fused [{fuse_time:.1f}s]")
+
+    ngff = {
+        "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "y", "x"]},
+        "zarr_format": 3,
+        "node_type": "group",
+    }
+    with open(output_path / "scale0" / "zarr.json", "w") as f:
+        json.dump(ngff, f, indent=2)
+
+    step_start = time.time()
+    log("Building multiscale pyramid...")
+    tf._create_multiscales(output_path, factors=tf.multiscale_factors)
+    tf._generate_ngff_zarr3_json(output_path, resolution_multiples=tf.resolution_multiples)
+    pyramid_time = time.time() - step_start
+    log(f"Pyramid built [{pyramid_time:.1f}s]")
+
+    return str(output_path)
+
+
 class FusionWorker(QThread):
     """Worker thread for running tile fusion."""
 
@@ -360,132 +481,27 @@ class FusionWorker(QThread):
 
     def run(self):
         try:
-            from tilefusion import TileFusion
-            import shutil
             import time
-            import json
-            import gc
 
             start_time = time.time()
-
             self.progress.emit(f"Loading {self.tiff_path}...")
 
-            output_path = (
-                Path(self.tiff_path).parent / f"{Path(self.tiff_path).stem}_fused.ome.zarr"
-            )
-            # Multi-region output folder
-            output_folder = Path(self.tiff_path).parent / f"{Path(self.tiff_path).stem}_fused"
-
-            # Remove existing outputs if present
-            if output_path.exists():
-                shutil.rmtree(output_path)
-            if output_folder.exists():
-                shutil.rmtree(output_folder)
-
-            # Also remove metrics if not doing registration
-            metrics_path = Path(self.tiff_path).parent / "metrics.json"
-            if metrics_path.exists():
-                metrics_path.unlink()
-            # Remove multi-region metrics
-            for m in Path(self.tiff_path).parent.glob("metrics_*.json"):
-                m.unlink()
-
-            step_start = time.time()
-            tf = TileFusion(
+            self.output_path = _run_fusion_pipeline(
                 self.tiff_path,
-                output_path=output_path,
-                blend_pixels=self.blend_pixels,
-                downsample_factors=(self.downsample_factor, self.downsample_factor),
+                self.do_registration,
+                self.blend_pixels,
+                self.downsample_factor,
+                self.fusion_mode,
                 flatfield=self.flatfield,
                 darkfield=self.darkfield,
                 registration_z=self.registration_z,
                 registration_t=self.registration_t,
-                channel_to_use=self.registration_channel,
+                registration_channel=self.registration_channel,
+                log_fn=self.progress.emit,
             )
-            load_time = time.time() - step_start
-            self.progress.emit(f"Loaded {tf.n_tiles} tiles ({tf.Y}x{tf.X} each) [{load_time:.1f}s]")
-
-            # Check for multi-region dataset
-            if len(tf._unique_regions) > 1:
-                self.progress.emit(f"Multi-region dataset: {tf._unique_regions}")
-                tf.stitch_all_regions()
-                # Output folder for multi-region
-                output_folder = Path(self.tiff_path).parent / f"{Path(self.tiff_path).stem}_fused"
-                elapsed_time = time.time() - start_time
-                self.output_path = str(output_folder)
-                self.finished.emit(str(output_folder), elapsed_time)
-                return
-
-            # Registration step
-            step_start = time.time()
-            if self.do_registration:
-                self.progress.emit("Computing registration...")
-                tf.refine_tile_positions_with_cross_correlation()
-                tf.save_pairwise_metrics(metrics_path)
-                reg_time = time.time() - step_start
-                self.progress.emit(
-                    f"Registration complete: {len(tf.pairwise_metrics)} pairs [{reg_time:.1f}s]"
-                )
-            else:
-                tf.threshold = 1.0  # Skip registration
-                self.progress.emit("Using stage positions (no registration)")
-
-            # Optimize shifts
-            step_start = time.time()
-            self.progress.emit("Optimizing positions...")
-            tf.optimize_shifts(
-                method="TWO_ROUND_ITERATIVE", rel_thresh=0.5, abs_thresh=2.0, iterative=True
-            )
-            gc.collect()
-
-            import numpy as np
-
-            tf._tile_positions = [
-                tuple(np.array(pos) + off * np.array(tf.pixel_size))
-                for pos, off in zip(tf._tile_positions, tf.global_offsets)
-            ]
-            opt_time = time.time() - step_start
-            self.progress.emit(f"Positions optimized [{opt_time:.1f}s]")
-
-            # Compute fused space
-            step_start = time.time()
-            self.progress.emit("Computing fused image space...")
-            tf._compute_fused_image_space()
-            tf._pad_to_chunk_multiple()
-            self.progress.emit(f"Output size: {tf.padded_shape[0]} x {tf.padded_shape[1]}")
-
-            # Create output store
-            scale0 = output_path / "scale0" / "image"
-            scale0.parent.mkdir(parents=True, exist_ok=True)
-            tf._create_fused_tensorstore(output_path=scale0)
-
-            # Fuse tiles
-            mode_label = "direct placement" if self.fusion_mode == "direct" else "blended"
-            self.progress.emit(f"Fusing tiles ({mode_label})...")
-            tf._fuse_tiles(mode=self.fusion_mode)
-            fuse_time = time.time() - step_start
-            self.progress.emit(f"Tiles fused [{fuse_time:.1f}s]")
-
-            # Write metadata
-            ngff = {
-                "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "y", "x"]},
-                "zarr_format": 3,
-                "node_type": "group",
-            }
-            with open(output_path / "scale0" / "zarr.json", "w") as f:
-                json.dump(ngff, f, indent=2)
-
-            # Build multiscales
-            step_start = time.time()
-            self.progress.emit("Building multiscale pyramid...")
-            tf._create_multiscales(output_path, factors=tf.multiscale_factors)
-            tf._generate_ngff_zarr3_json(output_path, resolution_multiples=tf.resolution_multiples)
-            pyramid_time = time.time() - step_start
-            self.progress.emit(f"Pyramid built [{pyramid_time:.1f}s]")
 
             elapsed_time = time.time() - start_time
-            self.output_path = str(output_path)
-            self.finished.emit(str(output_path), elapsed_time)
+            self.finished.emit(self.output_path, elapsed_time)
 
         except Exception as e:
             import traceback
@@ -537,7 +553,20 @@ class BatchFusionWorker(QThread):
             self.item_started.emit(idx, total, name)
 
             try:
-                self._process_one(idx, total, tiff_path)
+
+                def log_fn(msg, _idx=idx, _total=total, _name=name):
+                    self._log(_idx, _total, _name, msg)
+
+                _run_fusion_pipeline(
+                    tiff_path,
+                    self.do_registration,
+                    self.blend_pixels,
+                    self.downsample_factor,
+                    self.fusion_mode,
+                    flatfield=self.flatfield,
+                    darkfield=self.darkfield,
+                    log_fn=log_fn,
+                )
                 succeeded += 1
             except Exception as e:
                 import traceback
@@ -550,114 +579,6 @@ class BatchFusionWorker(QThread):
 
         total_time = time.time() - batch_start
         self.finished.emit(succeeded, failed, total_time)
-
-    def _process_one(self, idx, total, tiff_path):
-        import gc
-        import json
-        import shutil
-        import time
-
-        import numpy as np
-        from tilefusion import TileFusion
-
-        name = Path(tiff_path).name
-
-        def log(msg):
-            self._log(idx, total, name, msg)
-
-        log("Loading...")
-
-        output_path = Path(tiff_path).parent / f"{Path(tiff_path).stem}_fused.ome.zarr"
-        output_folder = Path(tiff_path).parent / f"{Path(tiff_path).stem}_fused"
-
-        if output_path.exists():
-            shutil.rmtree(output_path)
-        if output_folder.exists():
-            shutil.rmtree(output_folder)
-
-        metrics_path = Path(tiff_path).parent / "metrics.json"
-        if metrics_path.exists():
-            metrics_path.unlink()
-        for m in Path(tiff_path).parent.glob("metrics_*.json"):
-            m.unlink()
-
-        step_start = time.time()
-        tf = TileFusion(
-            tiff_path,
-            output_path=output_path,
-            blend_pixels=self.blend_pixels,
-            downsample_factors=(self.downsample_factor, self.downsample_factor),
-            flatfield=self.flatfield,
-            darkfield=self.darkfield,
-        )
-        load_time = time.time() - step_start
-        log(f"Loaded {tf.n_tiles} tiles ({tf.Y}x{tf.X}) [{load_time:.1f}s]")
-
-        # Multi-region dataset
-        if len(tf._unique_regions) > 1:
-            log(f"Multi-region dataset: {tf._unique_regions}")
-            tf.stitch_all_regions()
-            return
-
-        # Registration
-        step_start = time.time()
-        if self.do_registration:
-            log("Computing registration...")
-            tf.refine_tile_positions_with_cross_correlation()
-            tf.save_pairwise_metrics(metrics_path)
-            reg_time = time.time() - step_start
-            log(f"Registration: {len(tf.pairwise_metrics)} pairs [{reg_time:.1f}s]")
-        else:
-            tf.threshold = 1.0
-            log("Using stage positions (no registration)")
-
-        # Optimize
-        step_start = time.time()
-        log("Optimizing positions...")
-        tf.optimize_shifts(
-            method="TWO_ROUND_ITERATIVE", rel_thresh=0.5, abs_thresh=2.0, iterative=True
-        )
-        gc.collect()
-
-        tf._tile_positions = [
-            tuple(np.array(pos) + off * np.array(tf.pixel_size))
-            for pos, off in zip(tf._tile_positions, tf.global_offsets)
-        ]
-        opt_time = time.time() - step_start
-        log(f"Positions optimized [{opt_time:.1f}s]")
-
-        # Fused space
-        step_start = time.time()
-        tf._compute_fused_image_space()
-        tf._pad_to_chunk_multiple()
-        log(f"Output size: {tf.padded_shape[0]} x {tf.padded_shape[1]}")
-
-        scale0 = output_path / "scale0" / "image"
-        scale0.parent.mkdir(parents=True, exist_ok=True)
-        tf._create_fused_tensorstore(output_path=scale0)
-
-        mode_label = "direct placement" if self.fusion_mode == "direct" else "blended"
-        log(f"Fusing tiles ({mode_label})...")
-        tf._fuse_tiles(mode=self.fusion_mode)
-        fuse_time = time.time() - step_start
-        log(f"Tiles fused [{fuse_time:.1f}s]")
-
-        # Metadata
-        ngff = {
-            "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "y", "x"]},
-            "zarr_format": 3,
-            "node_type": "group",
-        }
-        with open(output_path / "scale0" / "zarr.json", "w") as f:
-            json.dump(ngff, f, indent=2)
-
-        # Multiscales
-        step_start = time.time()
-        log("Building multiscale pyramid...")
-        tf._create_multiscales(output_path, factors=tf.multiscale_factors)
-        tf._generate_ngff_zarr3_json(output_path, resolution_multiples=tf.resolution_multiples)
-        pyramid_time = time.time() - step_start
-        log(f"Done [{pyramid_time:.1f}s]")
 
 
 class DropArea(QFrame):
@@ -691,8 +612,11 @@ class DropArea(QFrame):
         self.label.setStyleSheet("border: none; background: transparent;")
         layout.addWidget(self.label)
 
-        self.file_path = None
-        self.file_paths = []  # All validated paths for batch mode
+        self.file_paths = []
+
+    @property
+    def file_path(self):
+        return self.file_paths[0] if self.file_paths else None
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -759,7 +683,6 @@ class DropArea(QFrame):
                 self.fileDropped.emit(folder_path)
 
     def setFile(self, file_path):
-        self.file_path = file_path
         self.file_paths = [file_path]
         path = Path(file_path)
         self.setStyleSheet(self._active_style)
@@ -935,8 +858,7 @@ class StitcherGUI(QMainWindow):
         self.is_multi_region = False
 
         # Batch processing state
-        self.batch_paths = []  # Validated paths for batch mode
-        self.is_batch_mode = False
+        self.batch_paths = []
 
         # Flatfield correction state
         self.flatfield = None  # Shape (C, Y, X) or None
@@ -1225,14 +1147,18 @@ class StitcherGUI(QMainWindow):
 
         layout.addStretch()
 
-    def _set_batch_mode(self, enabled):
-        """Enable/disable batch mode — grays out features that don't apply to batch."""
-        self.is_batch_mode = enabled
-        self.preview_button.setEnabled(not enabled)
-        self.calc_flatfield_button.setEnabled(not enabled and self.drop_area.file_path is not None)
-        self.reg_zt_widget.setEnabled(not enabled)
+    @property
+    def is_batch_mode(self):
+        return len(self.batch_paths) > 1
+
+    def _update_batch_mode_ui(self):
+        """Update UI to reflect batch vs single mode."""
+        batch = self.is_batch_mode
+        self.preview_button.setEnabled(not batch)
+        self.calc_flatfield_button.setEnabled(not batch and self.drop_area.file_path is not None)
+        self.reg_zt_widget.setEnabled(not batch)
         self.napari_button.setEnabled(False)
-        if enabled:
+        if batch:
             self.preview_button.setToolTip("Preview is not available in batch mode")
             self.calc_flatfield_button.setToolTip(
                 "Calculate flatfield from a single dataset first, then load it for batch"
@@ -1245,8 +1171,8 @@ class StitcherGUI(QMainWindow):
 
     def on_file_dropped(self, file_path):
         """Handle single file/folder drop — exits batch mode."""
-        self._set_batch_mode(False)
         self.batch_paths = []
+        self._update_batch_mode_ui()
 
         path = Path(file_path)
         if path.is_dir():
@@ -1336,12 +1262,9 @@ class StitcherGUI(QMainWindow):
         # Update DropArea display with validation results
         self.drop_area.setFiles(valid_paths, invalid_names)
         self.batch_paths = valid_paths
-        self._set_batch_mode(True)
+        self._update_batch_mode_ui()
         self.run_button.setEnabled(True)
 
-        # Clear single-dataset state
-        self.flatfield_status.setText("No flatfield")
-        self.flatfield_status.setStyleSheet("color: #86868b; font-size: 11px;")
         self.dataset_n_z = 1
         self.dataset_n_t = 1
         self.dataset_n_channels = 1
@@ -1623,7 +1546,7 @@ class StitcherGUI(QMainWindow):
         flatfield = self.flatfield if self.flatfield_checkbox.isChecked() else None
         darkfield = self.darkfield if self.flatfield_checkbox.isChecked() else None
 
-        if self.is_batch_mode and len(self.batch_paths) > 1:
+        if self.is_batch_mode:
             self._run_batch(blend_pixels, fusion_mode, flatfield, darkfield)
         else:
             self._run_single(blend_pixels, fusion_mode, flatfield, darkfield)
