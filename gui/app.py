@@ -547,6 +547,7 @@ class BatchFusionWorker(QThread):
             import traceback
 
             self.error.emit(f"Batch processing failed: {e}\n{traceback.format_exc()}")
+            self.finished.emit(0, len(self.paths), 0.0)
 
     def _run_batch(self):
         import time
@@ -1175,10 +1176,12 @@ class StitcherGUI(QMainWindow):
             self.calc_flatfield_button.setToolTip(
                 "Calculate flatfield from a single dataset first, then load it for batch"
             )
+            self.reg_zt_widget.setToolTip("Registration z/t/channel uses defaults in batch mode")
             self.napari_button.setToolTip("Open individual outputs in Napari after batch completes")
         else:
             self.preview_button.setToolTip("")
             self.calc_flatfield_button.setToolTip("")
+            self.reg_zt_widget.setToolTip("")
             self.napari_button.setToolTip("")
 
     def on_file_dropped(self, file_path):
@@ -1271,7 +1274,20 @@ class StitcherGUI(QMainWindow):
             self.run_button.setEnabled(False)
             return
 
-        # Update DropArea display with validation results
+        if invalid_names:
+            self.log(
+                f"\n{len(valid_paths)} of {len(paths)} valid. "
+                f"Skipped: {', '.join(invalid_names)}"
+            )
+
+        # Single valid item — fall back to normal single-item flow
+        if len(valid_paths) == 1:
+            self.log(f"\nOnly 1 valid item — using single mode.")
+            self.drop_area.setFile(valid_paths[0])
+            self.on_file_dropped(valid_paths[0])
+            return
+
+        # Multiple valid items — enter batch mode
         self.drop_area.setFiles(valid_paths, invalid_names)
         self.batch_paths = valid_paths
         self._update_batch_mode_ui()
@@ -1282,12 +1298,7 @@ class StitcherGUI(QMainWindow):
         self.dataset_n_channels = 1
         self.dataset_channel_names = []
 
-        if invalid_names:
-            self.log(
-                f"\n{len(valid_paths)} of {len(paths)} valid. "
-                f"Skipped: {', '.join(invalid_names)}"
-            )
-        else:
+        if not invalid_names:
             self.log(f"\nAll {len(valid_paths)} items valid. Ready to run batch.")
 
     def on_registration_toggled(self, checked):
@@ -1621,10 +1632,9 @@ class StitcherGUI(QMainWindow):
     def _on_batch_finished(self, succeeded, failed, total_time):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 0)  # Reset to indeterminate for next run
+        self.batch_paths = []
         self.run_button.setEnabled(True)
-        self.preview_button.setEnabled(True)
-        self.calc_flatfield_button.setEnabled(True)
-        self.reg_zt_widget.setEnabled(True)
+        self._update_batch_mode_ui()
 
         minutes = int(total_time // 60)
         seconds = total_time % 60
