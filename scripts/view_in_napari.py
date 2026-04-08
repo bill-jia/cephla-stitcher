@@ -3,6 +3,7 @@
 Simple script to view fused OME-Zarr in napari.
 Works around napari-ome-zarr plugin issues with Zarr v3.
 """
+
 import sys
 from pathlib import Path
 
