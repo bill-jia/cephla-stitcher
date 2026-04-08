@@ -1170,14 +1170,12 @@ class StitcherGUI(QMainWindow):
         self.preview_button.setEnabled(not batch)
         self.calc_flatfield_button.setEnabled(not batch and self.drop_area.file_path is not None)
         self.reg_zt_widget.setEnabled(not batch)
-        self.napari_button.setEnabled(False)
         if batch:
             self.preview_button.setToolTip("Preview is not available in batch mode")
             self.calc_flatfield_button.setToolTip(
                 "Calculate flatfield from a single dataset first, then load it for batch"
             )
             self.reg_zt_widget.setToolTip("Registration z/t/channel uses defaults in batch mode")
-            self.napari_button.setToolTip("Open individual outputs in Napari after batch completes")
         else:
             self.preview_button.setToolTip("")
             self.calc_flatfield_button.setToolTip("")
@@ -1634,6 +1632,7 @@ class StitcherGUI(QMainWindow):
         self.progress_bar.setRange(0, 0)  # Reset to indeterminate for next run
         self.batch_paths = []
         self.run_button.setEnabled(True)
+        self.napari_button.setEnabled(True)
         self._update_batch_mode_ui()
 
         minutes = int(total_time // 60)
@@ -1760,6 +1759,13 @@ class StitcherGUI(QMainWindow):
 
     def open_in_napari(self):
         if not self.output_path:
+            try:
+                import napari
+
+                napari.Viewer()
+                napari.run()
+            except Exception as e:
+                self.log(f"Error opening Napari: {e}")
             return
 
         # Determine the actual zarr path to open
