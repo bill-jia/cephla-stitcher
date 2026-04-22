@@ -21,6 +21,12 @@ from .zarr import (
     write_ngff_metadata,
     write_scale_group_metadata,
 )
+from .ngff_ome_zarr import (
+    is_ngff_ome_zarr,
+    load_ngff_ome_zarr_metadata,
+    read_ngff_ome_zarr_tile,
+    read_ngff_ome_zarr_region,
+)
 
 __all__ = [
     "load_ome_tiff_metadata",
@@ -38,4 +44,8 @@ __all__ = [
     "create_zarr_store",
     "write_ngff_metadata",
     "write_scale_group_metadata",
+    "is_ngff_ome_zarr",
+    "load_ngff_ome_zarr_metadata",
+    "read_ngff_ome_zarr_tile",
+    "read_ngff_ome_zarr_region",
 ]

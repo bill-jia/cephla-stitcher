@@ -38,6 +38,7 @@ from .io import (
     load_individual_tiffs_metadata,
     load_ome_tiff_tiles_metadata,
     load_zarr_metadata,
+    load_ngff_ome_zarr_metadata,
     read_ome_tiff_tile,
     read_ome_tiff_region,
     read_individual_tiffs_tile,
@@ -46,6 +47,9 @@ from .io import (
     read_ome_tiff_tiles_region,
     read_zarr_tile,
     read_zarr_region,
+    read_ngff_ome_zarr_tile,
+    read_ngff_ome_zarr_region,
+    is_ngff_ome_zarr,
     create_zarr_store,
     write_ngff_metadata,
     write_scale_group_metadata,
@@ -125,6 +129,7 @@ class TileFusion:
 
         # Detect and load format
         self._is_zarr_format = False
+        self._is_ngff_ome_zarr_format = False
         self._is_individual_tiffs_format = False
         self._is_ome_tiff_tiles_format = False
         self._metadata = {}
@@ -140,12 +145,19 @@ class TileFusion:
                 if zarr_json.exists():
                     with open(zarr_json) as f:
                         meta = json.load(f)
-                    if "attributes" in meta and "per_index_metadata" in meta.get("attributes", {}):
+                    attrs = meta.get("attributes", {})
+                    if "per_index_metadata" in attrs:
                         self._is_zarr_format = True
                         self._metadata = load_zarr_metadata(self.tiff_path)
+                    elif is_ngff_ome_zarr(self.tiff_path):
+                        self._is_ngff_ome_zarr_format = True
+                        self._metadata = load_ngff_ome_zarr_metadata(self.tiff_path)
                     else:
                         self._is_individual_tiffs_format = True
                         self._metadata = load_individual_tiffs_metadata(self.tiff_path)
+                elif is_ngff_ome_zarr(self.tiff_path):
+                    self._is_ngff_ome_zarr_format = True
+                    self._metadata = load_ngff_ome_zarr_metadata(self.tiff_path)
                 else:
                     self._is_individual_tiffs_format = True
                     self._metadata = load_individual_tiffs_metadata(self.tiff_path)
@@ -357,6 +369,7 @@ class TileFusion:
         # Only applies to OME-TIFF format (not zarr, individual tiffs, etc.)
         if (
             self._is_zarr_format
+            or self._is_ngff_ome_zarr_format
             or self._is_individual_tiffs_format
             or self._is_ome_tiff_tiles_format
         ):
@@ -472,6 +485,15 @@ class TileFusion:
             zarr_ts = self._metadata["tensorstore"]
             is_3d = self._metadata.get("is_3d", False)
             tile = read_zarr_tile(zarr_ts, tile_idx, is_3d)
+        elif self._is_ngff_ome_zarr_format:
+            tile = read_ngff_ome_zarr_tile(
+                self._metadata["tile_stores"],
+                self._metadata["tile_identifiers"],
+                self._metadata["tile_axes"],
+                tile_idx,
+                z_level=z_level,
+                time_idx=time_idx,
+            )
         elif self._is_individual_tiffs_format:
             tile = read_individual_tiffs_tile(
                 self._metadata["image_folder"],
@@ -522,6 +544,18 @@ class TileFusion:
             is_3d = self._metadata.get("is_3d", False)
             region = read_zarr_region(
                 zarr_ts, tile_idx, y_slice, x_slice, self.channel_to_use, is_3d
+            )
+        elif self._is_ngff_ome_zarr_format:
+            region = read_ngff_ome_zarr_region(
+                self._metadata["tile_stores"],
+                self._metadata["tile_identifiers"],
+                self._metadata["tile_axes"],
+                tile_idx,
+                y_slice,
+                x_slice,
+                channel_idx=self.channel_to_use,
+                z_level=z_level,
+                time_idx=time_idx,
             )
         elif self._is_individual_tiffs_format:
             region = read_individual_tiffs_region(
