@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tilefusion"
-version = "0.1.0"
+name = "cephla_tilefusion"
+version = "0.1.1"
 description = "GPU/CPU-accelerated tile registration and fusion for 2D microscopy"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -67,7 +67,7 @@ dev = [
     "mypy>=1.0",
 ]
 all = [
-    "tilefusion[gpu,gui,flatfield,dev]",
+    "cephla_tilefusion[gpu,gui,flatfield,dev]",
 ]
 
 [project.scripts]
@@ -84,7 +84,7 @@ Issues = "https://github.com/cephla/tilefusion/issues"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tilefusion", "gui", "scripts"]
+packages = ["src/cephla_tilefusion", "gui", "scripts"]
 
 [tool.black]
 line-length = 100
@@ -116,4 +116,4 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --cov=tilefusion --cov-report=term-missing"
+addopts = "-v --cov=cephla_tilefusion --cov-report=term-missing"

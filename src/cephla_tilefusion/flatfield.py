@@ -178,6 +178,7 @@ def apply_flatfield_region(
     darkfield: Optional[np.ndarray],
     y_slice: slice,
     x_slice: slice,
+    channel_idx: Optional[int] = None,
 ) -> np.ndarray:
     """
     Apply flatfield correction to a tile region.
@@ -192,6 +193,12 @@ def apply_flatfield_region(
         Full darkfield correction array with shape (C, Y, X).
     y_slice, x_slice : slice
         Slices defining the region within the full tile.
+    channel_idx : int, optional
+        Index of the channel that ``region`` represents within the flatfield.
+        Required when ``region`` is 2D and the flatfield has multiple channels;
+        defaults to 0 for a single-channel flatfield. When ``region`` is 3D,
+        if provided, only the matching flatfield slice is used (region must
+        have one channel) — otherwise the channel counts must match.
 
     Returns
     -------
@@ -201,21 +208,50 @@ def apply_flatfield_region(
     Raises
     ------
     ValueError
-        If region and flatfield shapes are incompatible.
+        If region and flatfield shapes are incompatible, or ``channel_idx`` is
+        out of range.
     """
-    # Validate channel count for 3D regions
-    if region.ndim == 3 and region.shape[0] != flatfield.shape[0]:
+    n_ff_channels = flatfield.shape[0]
+
+    if channel_idx is not None and not (0 <= channel_idx < n_ff_channels):
         raise ValueError(
-            f"Region has {region.shape[0]} channels but flatfield has {flatfield.shape[0]} channels"
+            f"channel_idx={channel_idx} is out of range for flatfield with "
+            f"{n_ff_channels} channels"
         )
 
-    # Extract corresponding flatfield/darkfield regions
     if region.ndim == 2:
-        ff_region = flatfield[0, y_slice, x_slice]
-        df_region = darkfield[0, y_slice, x_slice] if darkfield is not None else None
+        if channel_idx is None:
+            if n_ff_channels != 1:
+                raise ValueError(
+                    f"Region is 2D but flatfield has {n_ff_channels} channels; "
+                    "pass channel_idx to select which slice to apply"
+                )
+            ch = 0
+        else:
+            ch = channel_idx
+        ff_region = flatfield[ch, y_slice, x_slice]
+        df_region = darkfield[ch, y_slice, x_slice] if darkfield is not None else None
     else:
-        ff_region = flatfield[:, y_slice, x_slice]
-        df_region = darkfield[:, y_slice, x_slice] if darkfield is not None else None
+        if channel_idx is not None:
+            if region.shape[0] != 1:
+                raise ValueError(
+                    f"channel_idx was provided but region has {region.shape[0]} "
+                    "channels; expected 1"
+                )
+            ff_region = flatfield[channel_idx : channel_idx + 1, y_slice, x_slice]
+            df_region = (
+                darkfield[channel_idx : channel_idx + 1, y_slice, x_slice]
+                if darkfield is not None
+                else None
+            )
+        else:
+            if region.shape[0] != n_ff_channels:
+                raise ValueError(
+                    f"Region has {region.shape[0]} channels but flatfield has "
+                    f"{n_ff_channels} channels"
+                )
+            ff_region = flatfield[:, y_slice, x_slice]
+            df_region = darkfield[:, y_slice, x_slice] if darkfield is not None else None
 
     # Convert to float32 to avoid underflow with unsigned integer types
     region_f = region.astype(np.float32)

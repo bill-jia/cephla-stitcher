@@ -591,7 +591,12 @@ class TileFusion:
         # Apply flatfield correction if enabled
         if self._flatfield is not None:
             region = apply_flatfield_region(
-                region, self._flatfield, self._darkfield, y_slice, x_slice
+                region,
+                self._flatfield,
+                self._darkfield,
+                y_slice,
+                x_slice,
+                channel_idx=self.channel_to_use,
             )
 
         return region
