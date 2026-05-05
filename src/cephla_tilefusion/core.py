@@ -179,27 +179,15 @@ class TileFusion:
         self._tile_positions = self._metadata["tile_positions"]
         self._tile_identifiers = self._metadata.get("tile_identifiers", [])
         self._unique_regions = self._metadata.get("unique_regions", [])
-        self._region = region
 
-        # Filter to specific region if requested
-        if region is not None and self._tile_identifiers:
-            filtered_positions = []
-            filtered_identifiers = []
-            for pos, tile_id in zip(self._tile_positions, self._tile_identifiers):
-                if len(tile_id) >= 2 and tile_id[0] == region:
-                    filtered_positions.append(pos)
-                    filtered_identifiers.append(tile_id)
-            if not filtered_positions:
-                raise ValueError(f"No tiles found for region '{region}'")
-            self._tile_positions = filtered_positions
-            self._tile_identifiers = filtered_identifiers
-            self.n_tiles = len(filtered_positions)
-            self.n_series = self.n_tiles
-            self.position_dim = self.n_tiles
-            # Update metadata for reading tiles
-            self._metadata["tile_positions"] = filtered_positions
-            self._metadata["tile_identifiers"] = filtered_identifiers
-            self._metadata["n_tiles"] = self.n_tiles
+        # Snapshot the unfiltered tile listing so set_region() can re-filter
+        # without re-walking the dataset (important for HCS plates where
+        # discovery is the dominant cost).
+        self._all_tile_positions = list(self._tile_positions)
+        self._all_tile_identifiers = list(self._tile_identifiers)
+        self._region = None
+        # Region filter (if requested) is applied at the end of __init__ once
+        # registration/fusion state has been initialized.
 
         # Z-stack and time series properties
         self.n_z = self._metadata.get("n_z", 1)
@@ -273,6 +261,61 @@ class TileFusion:
         self._thread_local = threading.local()
         self._handles_lock = threading.Lock()
         self._all_handles: List[tifffile.TiffFile] = []
+
+        # Apply region filter now that state attributes are all initialized.
+        # Formats without tile identifiers (e.g. plain OME-TIFF) silently skip
+        # the filter for backward compatibility.
+        if region is not None and self._all_tile_identifiers:
+            self.set_region(region)
+
+    def set_region(self, region: Optional[str]) -> None:
+        """Re-filter active tiles to a single region without reloading metadata.
+
+        Lets a caller stitch many regions of an HCS plate without paying the
+        per-region discovery cost (which scans every tile in the dataset).
+        Pass ``None`` to clear the filter and expose all tiles again.
+
+        Resets registration and fusion state (``pairwise_metrics``,
+        ``global_offsets``, fused output, etc.) since they are region-specific.
+        Callers that want to reuse an instance across regions should also
+        update ``output_path`` and ``metrics_filename`` between regions.
+        """
+        if region is None:
+            positions = list(self._all_tile_positions)
+            identifiers = list(self._all_tile_identifiers)
+        else:
+            if not self._all_tile_identifiers:
+                raise ValueError(
+                    "Cannot filter by region: dataset has no tile identifiers"
+                )
+            positions = []
+            identifiers = []
+            for pos, tile_id in zip(self._all_tile_positions, self._all_tile_identifiers):
+                if len(tile_id) >= 2 and tile_id[0] == region:
+                    positions.append(pos)
+                    identifiers.append(tile_id)
+            if not positions:
+                raise ValueError(f"No tiles found for region '{region}'")
+
+        self._region = region
+        self._tile_positions = positions
+        self._tile_identifiers = identifiers
+        self.n_tiles = len(positions)
+        self.n_series = self.n_tiles
+        self.position_dim = self.n_tiles
+        self._metadata["tile_positions"] = positions
+        self._metadata["tile_identifiers"] = identifiers
+        self._metadata["n_tiles"] = self.n_tiles
+
+        # Reset per-region registration/fusion state.
+        self.pairwise_metrics = {}
+        self.global_offsets = None
+        self.offset = None
+        self.unpadded_shape = None
+        self.padded_shape = None
+        self.pad = (0, 0)
+        self.fused_ts = None
+        self.center = None
 
     def close(self) -> None:
         """
@@ -1354,25 +1397,10 @@ class TileFusion:
             print(f"Processing region {i+1}/{len(self._unique_regions)}: {region}")
             print(f"{'='*60}")
 
-            region_output = output_folder / f"{region}.ome.zarr"
-
-            tf = TileFusion(
-                self.tiff_path,
-                output_path=region_output,
-                blend_pixels=self._blend_pixels,
-                downsample_factors=self.downsample_factors,
-                ssim_window=self.ssim_window,
-                threshold=self.threshold,
-                multiscale_factors=self.multiscale_factors,
-                resolution_multiples=self.resolution_multiples,
-                max_workers=self._max_workers,
-                debug=self._debug,
-                metrics_filename=f"metrics_{region}.json",
-                channel_to_use=self.channel_to_use,
-                multiscale_downsample=self.multiscale_downsample,
-                region=region,
-            )
-            tf.run()
+            self.set_region(region)
+            self.output_path = output_folder / f"{region}.ome.zarr"
+            self.metrics_filename = f"metrics_{region}.json"
+            self.run()
 
         print(f"\n{'='*60}")
         print(f"All regions complete! Output: {output_folder}")
