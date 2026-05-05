@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cephla_tilefusion"
-version = "0.1.1"
+version = "0.1.2"
 description = "GPU/CPU-accelerated tile registration and fusion for 2D microscopy"
 readme = "README.md"
 license = "BSD-3-Clause"

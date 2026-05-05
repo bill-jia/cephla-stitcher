@@ -8,17 +8,8 @@ from typing import Any, Tuple, Union
 
 import numpy as np
 
-from .utils import (
-    USING_GPU,
-    block_reduce,
-    compute_ssim,
-    match_histograms,
-    phase_cross_correlation,
-    shift_array,
-    to_numpy,
-    xp,
-    cp,
-)
+from . import utils
+from .utils import compute_ssim, shift_array, to_numpy
 
 
 def register_pair_worker(args: Tuple) -> Tuple:
@@ -40,8 +31,8 @@ def register_pair_worker(args: Tuple) -> Tuple:
     try:
         # Downsample
         reduce_block = (1, df[0], df[1]) if patch_i.ndim == 3 else tuple(df)
-        g1 = block_reduce(patch_i, reduce_block, np.mean)
-        g2 = block_reduce(patch_j, reduce_block, np.mean)
+        g1 = utils.block_reduce(patch_i, reduce_block, np.mean)
+        g2 = utils.block_reduce(patch_j, reduce_block, np.mean)
 
         # Squeeze to 2D if needed
         while g1.ndim > 2 and g1.shape[0] == 1:
@@ -49,10 +40,10 @@ def register_pair_worker(args: Tuple) -> Tuple:
             g2 = g2[0]
 
         # Match histograms
-        g2 = match_histograms(g2, g1)
+        g2 = utils.match_histograms(g2, g1)
 
         # Phase cross-correlation
-        shift, _, _ = phase_cross_correlation(
+        shift, _, _ = utils.phase_cross_correlation(
             g1.astype(np.float32),
             g2.astype(np.float32),
             normalization="phase",
@@ -103,14 +94,15 @@ def register_and_score(
     ssim_val : float
         SSIM score.
     """
+    xp = utils.xp
     arr1 = xp.asarray(g1, dtype=xp.float32)
     arr2 = xp.asarray(g2, dtype=xp.float32)
     while arr1.ndim > 2 and arr1.shape[0] == 1:
         arr1 = arr1[0]
         arr2 = arr2[0]
 
-    arr2 = match_histograms(arr2, arr1)
-    shift, _, _ = phase_cross_correlation(
+    arr2 = utils.match_histograms(arr2, arr1)
+    shift, _, _ = utils.phase_cross_correlation(
         arr1,
         arr2,
         disambiguate=True,

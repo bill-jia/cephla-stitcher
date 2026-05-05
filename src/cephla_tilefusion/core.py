@@ -17,13 +17,8 @@ import tensorstore as ts
 import tifffile
 from tqdm import trange, tqdm
 
-from .utils import (
-    USING_GPU,
-    block_reduce,
-    cp,
-    make_1d_profile,
-    xp,
-)
+from . import utils
+from .utils import make_1d_profile, set_use_gpu, GPU_AVAILABLE
 from .registration import (
     compute_pair_bounds,
     find_adjacent_pairs,
@@ -88,6 +83,14 @@ class TileFusion:
         Channel index for registration.
     multiscale_downsample : str
         Either "stride" (default) or "block_mean" to control multiscale reduction.
+    use_gpu : bool, optional
+        Force the compute backend. ``True`` requires the optional GPU stack
+        (cupy + cucim) and raises ``RuntimeError`` otherwise. ``False`` runs
+        on CPU even when a GPU is available. ``None`` (default) leaves the
+        current global setting untouched (which is GPU when available, CPU
+        otherwise). The selection is process-global; constructing a second
+        ``TileFusion`` with a different value will switch the backend for
+        every active instance.
     """
 
     def __init__(
@@ -116,7 +119,11 @@ class TileFusion:
         darkfield: Optional[np.ndarray] = None,
         registration_z: Optional[int] = None,
         registration_t: int = 0,
+        use_gpu: Optional[bool] = None,
     ):
+        if use_gpu is not None:
+            set_use_gpu(use_gpu)
+
         self.tiff_path = Path(tiff_path)
         if not self.tiff_path.exists():
             raise FileNotFoundError(f"Path not found: {self.tiff_path}")
@@ -696,7 +703,7 @@ class TileFusion:
             parallel = is_multi_file
 
         # Use parallel processing for CPU mode with enough pairs
-        use_parallel = parallel and not USING_GPU and len(pair_bounds) > 4
+        use_parallel = parallel and not utils.USING_GPU and len(pair_bounds) > 4
 
         if use_parallel:
             self._register_parallel(pair_bounds, df, sw, th, max_shift)
@@ -850,12 +857,13 @@ class TileFusion:
                     print(f"Error reading patches for ({i_pos}, {j_pos}): {e}")
                 continue
 
+            xp = utils.xp
             arr_i = xp.asarray(patch_i)
             arr_j = xp.asarray(patch_j)
 
             reduce_block = (1, df[0], df[1]) if arr_i.ndim == 3 else tuple(df)
-            g1 = block_reduce(arr_i, reduce_block, xp.mean)
-            g2 = block_reduce(arr_j, reduce_block, xp.mean)
+            g1 = utils.block_reduce(arr_i, reduce_block, xp.mean)
+            g2 = utils.block_reduce(arr_j, reduce_block, xp.mean)
 
             try:
                 shift_ds, ssim_val = register_and_score(g1, g2, win_size=sw, debug=self._debug)
@@ -1121,9 +1129,9 @@ class TileFusion:
 
         del fused_block, weight_sum
         gc.collect()
-        if USING_GPU and cp is not None:
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
+        if utils.USING_GPU and utils.cp is not None:
+            utils.cp.get_default_memory_pool().free_all_blocks()
+            utils.cp.get_default_pinned_memory_pool().free_all_blocks()
 
     def _fuse_tiles_chunked_plane(
         self, z_level: int = 0, time_idx: int = 0, ram_fraction: float = 0.4
@@ -1222,9 +1230,9 @@ class TileFusion:
                 del fused_block, weight_sum
 
         gc.collect()
-        if USING_GPU and cp is not None:
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
+        if utils.USING_GPU and utils.cp is not None:
+            utils.cp.get_default_memory_pool().free_all_blocks()
+            utils.cp.get_default_pinned_memory_pool().free_all_blocks()
 
     # -------------------------------------------------------------------------
     # Multiscale pyramid
@@ -1273,13 +1281,14 @@ class TileFusion:
                     if self.multiscale_downsample == "stride":
                         down = slab[..., ::factor_to_use, ::factor_to_use]
                     else:
+                        xp = utils.xp
                         arr = xp.asarray(slab)
                         # Only downsample Y, X (last 2 dims)
                         block = (1, 1, 1, factor_to_use, factor_to_use)
-                        down_arr = block_reduce(arr, block_size=block, func=xp.mean)
+                        down_arr = utils.block_reduce(arr, block_size=block, func=xp.mean)
                         down = (
-                            cp.asnumpy(down_arr)
-                            if USING_GPU and cp is not None
+                            utils.cp.asnumpy(down_arr)
+                            if utils.USING_GPU and utils.cp is not None
                             else np.asarray(down_arr)
                         )
                     down = down.astype(slab.dtype, copy=False)

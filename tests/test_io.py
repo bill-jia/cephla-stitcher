@@ -1,4 +1,4 @@
-"""Tests for tilefusion.io module."""
+"""Tests for cephla_tilefusion.io module."""
 
 import json
 import tempfile
@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 import tifffile
 
-from tilefusion.io import (
+from cephla_tilefusion.io import (
     load_ome_tiff_metadata,
     load_individual_tiffs_metadata,
     read_individual_tiffs_tile,
@@ -220,7 +220,7 @@ class TestThreadSafety:
     def test_concurrent_reads_thread_local_handles(self, sample_ome_tiff):
         """Test that concurrent reads from multiple threads use separate handles."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from tilefusion import TileFusion
+        from cephla_tilefusion import TileFusion
 
         path, expected_data = sample_ome_tiff
 
@@ -276,7 +276,7 @@ class TestThreadSafety:
     def test_handles_cleaned_up_after_close(self, sample_ome_tiff):
         """Test that all thread-local handles are closed on cleanup."""
         from concurrent.futures import ThreadPoolExecutor
-        from tilefusion import TileFusion
+        from cephla_tilefusion import TileFusion
 
         path, _ = sample_ome_tiff
 
@@ -346,7 +346,7 @@ class TestTileFusionResourceManagement:
 
     def test_close_method(self, sample_ome_tiff):
         """Test that close() properly closes thread-local handles."""
-        from tilefusion import TileFusion
+        from cephla_tilefusion import TileFusion
 
         try:
             tf = TileFusion(sample_ome_tiff)
@@ -362,7 +362,7 @@ class TestTileFusionResourceManagement:
 
     def test_close_idempotent(self, sample_ome_tiff):
         """Test that close() can be called multiple times safely."""
-        from tilefusion import TileFusion
+        from cephla_tilefusion import TileFusion
 
         try:
             tf = TileFusion(sample_ome_tiff)
@@ -375,7 +375,7 @@ class TestTileFusionResourceManagement:
 
     def test_context_manager(self, sample_ome_tiff):
         """Test context manager protocol cleans up handles on exit."""
-        from tilefusion import TileFusion
+        from cephla_tilefusion import TileFusion
 
         try:
             with TileFusion(sample_ome_tiff) as tf:
@@ -567,7 +567,7 @@ class TestNgffOmeZarrFlat:
         assert np.allclose(region, 300.0)
 
     def test_tilefusion_detects_format(self, flat_dataset):
-        from tilefusion import TileFusion
+        from cephla_tilefusion import TileFusion
 
         root, _ = flat_dataset
         tf = TileFusion(root)
@@ -735,7 +735,7 @@ class TestNgffOmeZarrFormatDispatch:
 
     def test_existing_individual_tiffs_still_detected(self, tmp_path):
         """An individual-TIFFs folder must not be mis-detected as NGFF."""
-        from tilefusion.io.ngff_ome_zarr import is_ngff_ome_zarr as _is_ngff
+        from cephla_tilefusion.io.ngff_ome_zarr import is_ngff_ome_zarr as _is_ngff
 
         img_folder = tmp_path / "0"
         img_folder.mkdir()

@@ -3,6 +3,15 @@
 import numpy as np
 import pytest
 
+from cephla_tilefusion import set_use_gpu
+
+# Force the CPU backend for the entire test session. The unit tests pass plain
+# numpy arrays to backend-dispatched helpers (shift_array, compute_ssim, ...),
+# which would fail under the GPU backend because the GPU implementations
+# expect cupy arrays. Forcing CPU also makes the suite deterministic on hosts
+# with and without a GPU.
+set_use_gpu(False)
+
 
 @pytest.fixture
 def rng():

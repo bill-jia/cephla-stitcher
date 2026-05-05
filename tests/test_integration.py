@@ -1,6 +1,6 @@
 """Integration tests for TileFusion with synthetic tile data.
 
-Adapted from original tilefusion integration tests by Doug Shepherd / QI2lab.
+Adapted from original cephla_tilefusion integration tests by Doug Shepherd / QI2lab.
 """
 
 import json
@@ -13,7 +13,7 @@ import pytest
 import tensorstore as ts
 import tifffile
 
-from tilefusion import TileFusion
+from cephla_tilefusion import TileFusion
 
 
 def _write_individual_tiffs_folder(

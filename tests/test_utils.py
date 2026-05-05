@@ -1,9 +1,9 @@
-"""Tests for tilefusion.utils module."""
+"""Tests for cephla_tilefusion.utils module."""
 
 import numpy as np
 import pytest
 
-from tilefusion.utils import make_1d_profile, shift_array, compute_ssim, to_numpy
+from cephla_tilefusion.utils import make_1d_profile, shift_array, compute_ssim, to_numpy
 
 
 class TestMake1DProfile:

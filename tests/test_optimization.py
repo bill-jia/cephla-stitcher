@@ -1,9 +1,9 @@
-"""Tests for tilefusion.optimization module."""
+"""Tests for cephla_tilefusion.optimization module."""
 
 import numpy as np
 import pytest
 
-from tilefusion.optimization import (
+from cephla_tilefusion.optimization import (
     solve_global,
     two_round_optimization,
     links_from_pairwise_metrics,

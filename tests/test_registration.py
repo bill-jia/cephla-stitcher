@@ -1,9 +1,9 @@
-"""Tests for tilefusion.registration module."""
+"""Tests for cephla_tilefusion.registration module."""
 
 import numpy as np
 import pytest
 
-from tilefusion.registration import (
+from cephla_tilefusion.registration import (
     find_adjacent_pairs,
     compute_pair_bounds,
     register_and_score,

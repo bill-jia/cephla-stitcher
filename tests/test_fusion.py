@@ -1,9 +1,9 @@
-"""Tests for tilefusion.fusion module."""
+"""Tests for cephla_tilefusion.fusion module."""
 
 import numpy as np
 import pytest
 
-from tilefusion.fusion import accumulate_tile_shard, normalize_shard, blend_numba_2d
+from cephla_tilefusion.fusion import accumulate_tile_shard, normalize_shard, blend_numba_2d
 
 
 class TestAccumulateTileShard:
