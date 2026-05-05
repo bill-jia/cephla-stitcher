@@ -91,6 +91,14 @@ class TileFusion:
         otherwise). The selection is process-global; constructing a second
         ``TileFusion`` with a different value will switch the backend for
         every active instance.
+    fuse_read_workers : int
+        Number of threads used to prefetch tiles inside fusion. Tile reads
+        are sequential file decompresses; the empirical sweet spot on NVMe
+        is 4 (more workers cause I/O contention).
+    vram_fraction : float
+        Fraction of free VRAM the GPU fusion path is allowed to use for its
+        per-block fused/weight buffers. Lower values produce smaller blocks
+        and more tile re-reads; the cache absorbs most of the cost.
     """
 
     def __init__(
@@ -120,6 +128,8 @@ class TileFusion:
         registration_z: Optional[int] = None,
         registration_t: int = 0,
         use_gpu: Optional[bool] = None,
+        fuse_read_workers: int = 4,
+        vram_fraction: float = 0.3,
     ):
         if use_gpu is not None:
             set_use_gpu(use_gpu)
@@ -224,6 +234,12 @@ class TileFusion:
             r if hasattr(r, "__len__") else (r, r) for r in resolution_multiples
         ]
         self._max_workers = int(max_workers)
+        if int(fuse_read_workers) < 1:
+            raise ValueError("fuse_read_workers must be >= 1")
+        self._fuse_read_workers = int(fuse_read_workers)
+        if not 0.0 < float(vram_fraction) <= 1.0:
+            raise ValueError("vram_fraction must be in (0, 1]")
+        self._vram_fraction = float(vram_fraction)
         self._debug = bool(debug)
         self.metrics_filename = metrics_filename
         self._blend_pixels = tuple(blend_pixels)
@@ -652,6 +668,74 @@ class TileFusion:
         return region
 
     # -------------------------------------------------------------------------
+    # Tile prefetch helper (used by fusion)
+    # -------------------------------------------------------------------------
+
+    def _make_tile_fetcher(
+        self,
+        z_level: int,
+        time_idx: int,
+        read_workers: int,
+        last_block_for_tile: Optional[Dict[int, int]] = None,
+    ):
+        """Build a fetcher that prefetches tiles for fusion blocks.
+
+        Returns ``(fetch, close)`` where:
+          - ``fetch(block_idx, tile_idxs)`` returns ``{tile_idx: host_array}``
+            for every requested tile, decompressing missing ones (in parallel
+            when ``read_workers > 1``) and reusing already-cached entries.
+          - ``close()`` shuts the executor down and clears the cache.
+
+        When ``last_block_for_tile`` is supplied, an entry is evicted from
+        the cache as soon as the block whose index equals
+        ``last_block_for_tile[tile_idx]`` finishes consuming it. This lets
+        the fetcher hold tiles only as long as future blocks still need
+        them, capping peak memory. When ``None`` (e.g. single-block case),
+        cached tiles persist for the lifetime of the fetcher.
+
+        Tiles are returned in the package's standard ``(C, Y, X)`` shape
+        with single-channel inputs broadcast to the full channel count, so
+        callers can index ``tile[c, ...]`` uniformly.
+        """
+        C = self.channels
+        cache: Dict[int, np.ndarray] = {}
+        executor = (
+            ThreadPoolExecutor(max_workers=read_workers) if read_workers > 1 else None
+        )
+
+        def decompress(tidx: int) -> np.ndarray:
+            arr = self._read_tile(tidx, z_level=z_level, time_idx=time_idx)
+            if arr.shape[0] == 1 and C > 1:
+                arr = np.ascontiguousarray(
+                    np.broadcast_to(arr, (C, arr.shape[1], arr.shape[2]))
+                )
+            return arr
+
+        def fetch(block_idx: int, tile_idxs: Sequence[int]) -> Dict[int, np.ndarray]:
+            missing = [t for t in tile_idxs if t not in cache]
+            if missing:
+                if executor is not None and len(missing) > 1:
+                    futures = {t: executor.submit(decompress, t) for t in missing}
+                    for t, fut in futures.items():
+                        cache[t] = fut.result()
+                else:
+                    for t in missing:
+                        cache[t] = decompress(t)
+            result = {t: cache[t] for t in tile_idxs}
+            if last_block_for_tile is not None:
+                for t in tile_idxs:
+                    if last_block_for_tile.get(t) == block_idx:
+                        cache.pop(t, None)
+            return result
+
+        def close() -> None:
+            if executor is not None:
+                executor.shutdown(wait=True)
+            cache.clear()
+
+        return fetch, close
+
+    # -------------------------------------------------------------------------
     # Registration
     # -------------------------------------------------------------------------
 
@@ -997,9 +1081,22 @@ class TileFusion:
     # -------------------------------------------------------------------------
 
     def _fuse_tiles(
-        self, mode: str = "blended", chunked: bool = True, ram_fraction: float = 0.4
+        self,
+        mode: str = "blended",
+        chunked: bool = True,
+        ram_fraction: float = 0.4,
+        read_workers: Optional[int] = None,
+        vram_fraction: Optional[float] = None,
     ) -> None:
-        """Fuse all tiles into output, looping over z-levels and time points."""
+        """Fuse all tiles into output, looping over z-levels and time points.
+
+        When the GPU backend is active and ``mode='blended'``, fusion runs on
+        the GPU via :meth:`_fuse_tiles_gpu_chunked_plane` (which auto-falls to
+        a single block when the output fits the VRAM budget). The CPU paths
+        remain in place for ``mode='direct'`` and when GPU is disabled.
+        """
+        rw = self._fuse_read_workers if read_workers is None else int(read_workers)
+        vf = self._vram_fraction if vram_fraction is None else float(vram_fraction)
         total_planes = self.n_t * self.n_z
         plane_idx = 0
 
@@ -1011,10 +1108,24 @@ class TileFusion:
 
                 if mode == "direct":
                     self._fuse_tiles_direct_plane(z_level=z, time_idx=t)
+                elif utils.USING_GPU and utils.cp is not None:
+                    self._fuse_tiles_gpu_chunked_plane(
+                        z_level=z,
+                        time_idx=t,
+                        vram_fraction=vf,
+                        read_workers=rw,
+                    )
                 elif chunked:
-                    self._fuse_tiles_chunked_plane(z_level=z, time_idx=t, ram_fraction=ram_fraction)
+                    self._fuse_tiles_chunked_plane(
+                        z_level=z,
+                        time_idx=t,
+                        ram_fraction=ram_fraction,
+                        read_workers=rw,
+                    )
                 else:
-                    self._fuse_tiles_full_plane(z_level=z, time_idx=t)
+                    self._fuse_tiles_full_plane(
+                        z_level=z, time_idx=t, read_workers=rw
+                    )
 
     def _fuse_tiles_direct_plane(self, z_level: int = 0, time_idx: int = 0) -> None:
         """Fuse tiles using direct placement for a single z/t plane."""
@@ -1089,8 +1200,20 @@ class TileFusion:
 
         gc.collect()
 
-    def _fuse_tiles_full_plane(self, z_level: int = 0, time_idx: int = 0) -> None:
-        """Fuse all tiles using full-image accumulator for a single z/t plane."""
+    def _fuse_tiles_full_plane(
+        self,
+        z_level: int = 0,
+        time_idx: int = 0,
+        read_workers: Optional[int] = None,
+    ) -> None:
+        """Fuse all tiles using full-image accumulator for a single z/t plane.
+
+        Tile decompression is overlapped with numba accumulation by running
+        reads on a thread pool of size ``read_workers`` (default
+        ``self._fuse_read_workers``).
+        """
+        rw = self._fuse_read_workers if read_workers is None else int(read_workers)
+
         offsets = [
             (
                 int((y - self.offset[0]) / self._pixel_size[0]),
@@ -1106,21 +1229,24 @@ class TileFusion:
         w2d = self.y_profile[:, None] * self.x_profile[None, :]
 
         show_progress = self.n_t == 1 and self.n_z == 1
+
+        # Single-block fetch: ask for every tile at once, no eviction needed.
+        fetch, close = self._make_tile_fetcher(z_level, time_idx, rw)
+        try:
+            tiles = fetch(0, list(range(len(offsets))))
+        finally:
+            close()
+
         iterator = (
             trange(len(offsets), desc="fusing", leave=True)
             if show_progress
             else range(len(offsets))
         )
-
         for t_idx in iterator:
             oy, ox = offsets[t_idx]
-            tile_all = self._read_tile(t_idx, z_level=z_level, time_idx=time_idx)
+            accumulate_tile_shard(fused_block, weight_sum, tiles[t_idx], w2d, oy, ox)
 
-            if tile_all.shape[0] == 1 and C > 1:
-                tile_all = np.broadcast_to(tile_all, (C, tile_all.shape[1], tile_all.shape[2]))
-
-            accumulate_tile_shard(fused_block, weight_sum, tile_all, w2d, oy, ox)
-
+        del tiles
         normalize_shard(fused_block, weight_sum)
         # Write to 5D output: (T, C, Z, Y, X)
         self.fused_ts[time_idx, :, z_level, :pad_Y, :pad_X].write(
@@ -1133,11 +1259,70 @@ class TileFusion:
             utils.cp.get_default_memory_pool().free_all_blocks()
             utils.cp.get_default_pinned_memory_pool().free_all_blocks()
 
+    def _plan_fusion_blocks(
+        self, block_size: int
+    ) -> Tuple[List[Tuple[int, int, int, int, int, List[int]]], Dict[int, int], List[Tuple[int, int, int, int]]]:
+        """Plan output block layout and tile lifetimes.
+
+        Returns
+        -------
+        block_specs : list
+            Each entry is ``(block_idx, block_y, block_x, by_end, bx_end,
+            overlapping_tile_idxs)`` for blocks that contain at least one tile.
+        last_block_for_tile : dict
+            ``{tile_idx: last_block_idx_that_needs_it}`` — used by the cache
+            to evict tiles after their final use.
+        tile_bounds : list
+            Per-tile ``(ty0, ty1, tx0, tx1)`` rectangles in output coords.
+        """
+        pad_Y, pad_X = self.padded_shape
+        tile_bounds: List[Tuple[int, int, int, int]] = []
+        for y, x in self._tile_positions:
+            oy = int((y - self.offset[0]) / self._pixel_size[0])
+            ox = int((x - self.offset[1]) / self._pixel_size[1])
+            tile_bounds.append((oy, oy + self.Y, ox, ox + self.X))
+
+        block_specs: List[Tuple[int, int, int, int, int, List[int]]] = []
+        last_block_for_tile: Dict[int, int] = {}
+        block_idx = -1
+        for block_y in range(0, pad_Y, block_size):
+            for block_x in range(0, pad_X, block_size):
+                by_end = min(block_y + block_size, pad_Y)
+                bx_end = min(block_x + block_size, pad_X)
+                overlapping = [
+                    tidx
+                    for tidx, (ty0, ty1, tx0, tx1) in enumerate(tile_bounds)
+                    if ty1 > block_y and ty0 < by_end and tx1 > block_x and tx0 < bx_end
+                ]
+                if not overlapping:
+                    continue
+                block_idx += 1
+                block_specs.append(
+                    (block_idx, block_y, block_x, by_end, bx_end, overlapping)
+                )
+                for tidx in overlapping:
+                    last_block_for_tile[tidx] = block_idx
+        return block_specs, last_block_for_tile, tile_bounds
+
     def _fuse_tiles_chunked_plane(
-        self, z_level: int = 0, time_idx: int = 0, ram_fraction: float = 0.4
+        self,
+        z_level: int = 0,
+        time_idx: int = 0,
+        ram_fraction: float = 0.4,
+        read_workers: Optional[int] = None,
     ) -> None:
-        """Fuse tiles using memory-efficient chunked processing for a single z/t plane."""
+        """Fuse tiles using memory-efficient chunked processing for a single z/t plane.
+
+        When the chosen block size is large enough that the output fits in
+        one block, falls through to :meth:`_fuse_tiles_full_plane` so that
+        path's numba kernel is used. Otherwise iterates output blocks,
+        prefetching only the tiles each block needs (parallel reads when
+        ``read_workers > 1``) with a small cache so a tile straddling a
+        block boundary is decompressed once.
+        """
         import psutil
+
+        rw = self._fuse_read_workers if read_workers is None else int(read_workers)
 
         available_ram = psutil.virtual_memory().available
         usable_ram = int(available_ram * ram_fraction)
@@ -1153,53 +1338,36 @@ class TileFusion:
         if block_size >= max(pad_Y, pad_X):
             if self.n_t == 1 and self.n_z == 1:
                 print(f"Image fits in RAM budget, using full mode")
-            return self._fuse_tiles_full_plane(z_level=z_level, time_idx=time_idx)
+            return self._fuse_tiles_full_plane(
+                z_level=z_level, time_idx=time_idx, read_workers=rw
+            )
 
         show_progress = self.n_t == 1 and self.n_z == 1
         if show_progress:
             print(f"Using chunked mode: {block_size}x{block_size} blocks")
 
-        tile_bounds = []
-        for y, x in self._tile_positions:
-            oy = int((y - self.offset[0]) / self._pixel_size[0])
-            ox = int((x - self.offset[1]) / self._pixel_size[1])
-            tile_bounds.append((oy, oy + self.Y, ox, ox + self.X))
-
-        n_blocks_y = (pad_Y + block_size - 1) // block_size
-        n_blocks_x = (pad_X + block_size - 1) // block_size
-        total_blocks = n_blocks_y * n_blocks_x
+        block_specs, last_block_for_tile, tile_bounds = self._plan_fusion_blocks(block_size)
+        total_blocks = len(block_specs)
         C = self.channels
 
-        block_idx = 0
-        for block_y in range(0, pad_Y, block_size):
-            for block_x in range(0, pad_X, block_size):
-                block_idx += 1
-                by_end = min(block_y + block_size, pad_Y)
-                bx_end = min(block_x + block_size, pad_X)
+        fetch, close = self._make_tile_fetcher(
+            z_level, time_idx, rw, last_block_for_tile=last_block_for_tile
+        )
+        try:
+            for block_idx, block_y, block_x, by_end, bx_end, overlapping in block_specs:
                 bh, bw = by_end - block_y, bx_end - block_x
 
-                overlapping = []
-                for t_idx, (ty0, ty1, tx0, tx1) in enumerate(tile_bounds):
-                    if ty1 > block_y and ty0 < by_end and tx1 > block_x and tx0 < bx_end:
-                        overlapping.append(t_idx)
-
-                if not overlapping:
-                    continue
+                tiles = fetch(block_idx, overlapping)
 
                 fused_block = np.zeros((C, bh, bw), dtype=np.float32)
                 weight_sum = np.zeros_like(fused_block)
 
-                desc = f"block {block_idx}/{total_blocks}"
+                desc = f"block {block_idx + 1}/{total_blocks}"
                 iterator = (
                     tqdm(overlapping, desc=desc, leave=False) if show_progress else overlapping
                 )
                 for t_idx in iterator:
-                    tile_all = self._read_tile(t_idx, z_level=z_level, time_idx=time_idx)
-
-                    if tile_all.shape[0] == 1 and C > 1:
-                        tile_all = np.broadcast_to(
-                            tile_all, (C, tile_all.shape[1], tile_all.shape[2])
-                        )
+                    tile_all = tiles[t_idx]
 
                     ty0, ty1, tx0, tx1 = tile_bounds[t_idx]
 
@@ -1228,11 +1396,132 @@ class TileFusion:
                 ).result()
 
                 del fused_block, weight_sum
+        finally:
+            close()
 
         gc.collect()
         if utils.USING_GPU and utils.cp is not None:
             utils.cp.get_default_memory_pool().free_all_blocks()
             utils.cp.get_default_pinned_memory_pool().free_all_blocks()
+
+    def _fuse_tiles_gpu_chunked_plane(
+        self,
+        z_level: int = 0,
+        time_idx: int = 0,
+        vram_fraction: Optional[float] = None,
+        read_workers: Optional[int] = None,
+    ) -> None:
+        """Fuse one z/t plane on the GPU.
+
+        Mirrors :meth:`_fuse_tiles_chunked_plane` but allocates the per-block
+        ``fused`` and ``weight`` buffers in VRAM and runs accumulate +
+        normalize on the GPU. Block size is sized from free VRAM via
+        ``vram_fraction`` so the same code adapts to small GPUs by falling
+        to smaller blocks (more tile re-reads, absorbed by the cache).
+
+        Tile decompression and the final zarr write remain on the CPU; the
+        zstd codec used by the package's input format is already CPU-bound
+        at near-memory-bandwidth (~8.5 GB/s with blosc), so GPU decode
+        offers no win here.
+        """
+        cp = utils.cp
+        if cp is None:
+            raise RuntimeError(
+                "_fuse_tiles_gpu_chunked_plane called but cupy is unavailable"
+            )
+
+        rw = self._fuse_read_workers if read_workers is None else int(read_workers)
+        vf = self._vram_fraction if vram_fraction is None else float(vram_fraction)
+
+        # Pick block size from VRAM budget. We need two CxHxW float32 buffers
+        # (fused + weight); ignore the small per-tile transient since it is
+        # always smaller than one block.
+        free_bytes, _ = cp.cuda.Device().mem_info
+        usable = int(free_bytes * vf)
+        bytes_per_output_pixel = 2 * 4 * self.channels
+        max_pixels = max(1, usable // bytes_per_output_pixel)
+        block_size = int(np.sqrt(max_pixels))
+        block_size = (block_size // self.chunk_y) * self.chunk_y
+        block_size = max(block_size, self.chunk_y * 2)
+        block_size = min(block_size, 16384)
+
+        pad_Y, pad_X = self.padded_shape
+        C = self.channels
+
+        block_specs, last_block_for_tile, tile_bounds = self._plan_fusion_blocks(block_size)
+        total_blocks = len(block_specs)
+
+        show_progress = self.n_t == 1 and self.n_z == 1
+        if show_progress:
+            n_blocks_axis = max(1, (max(pad_Y, pad_X) + block_size - 1) // block_size)
+            print(
+                f"GPU fusion: {block_size}x{block_size} blocks "
+                f"({total_blocks} block{'s' if total_blocks != 1 else ''})"
+            )
+
+        # Weight profiles are tiny — keep on GPU for the whole plane.
+        y_profile_gpu = cp.asarray(self.y_profile, dtype=cp.float32)
+        x_profile_gpu = cp.asarray(self.x_profile, dtype=cp.float32)
+
+        fetch, close = self._make_tile_fetcher(
+            z_level, time_idx, rw, last_block_for_tile=last_block_for_tile
+        )
+        try:
+            iterator = (
+                tqdm(block_specs, desc="GPU fusing", leave=True)
+                if show_progress
+                else block_specs
+            )
+            for block_idx, block_y, block_x, by_end, bx_end, overlapping in iterator:
+                bh, bw = by_end - block_y, bx_end - block_x
+
+                tiles = fetch(block_idx, overlapping)
+
+                fused_block = cp.zeros((C, bh, bw), dtype=cp.float32)
+                weight_sum = cp.zeros_like(fused_block)
+
+                for t_idx in overlapping:
+                    tile_host = tiles[t_idx]
+                    ty0, ty1, tx0, tx1 = tile_bounds[t_idx]
+
+                    oy0 = max(ty0, block_y) - block_y
+                    oy1 = min(ty1, by_end) - block_y
+                    ox0 = max(tx0, block_x) - block_x
+                    ox1 = min(tx1, bx_end) - block_x
+                    sy0 = max(block_y - ty0, 0)
+                    sy1 = sy0 + (oy1 - oy0)
+                    sx0 = max(block_x - tx0, 0)
+                    sx1 = sx0 + (ox1 - ox0)
+
+                    # Upload only the slice we will consume.
+                    cpu_region = np.ascontiguousarray(tile_host[:, sy0:sy1, sx0:sx1])
+                    tile_region_gpu = cp.asarray(cpu_region)
+                    w2d = y_profile_gpu[sy0:sy1, None] * x_profile_gpu[None, sx0:sx1]
+
+                    fused_block[:, oy0:oy1, ox0:ox1] += tile_region_gpu.astype(
+                        cp.float32, copy=False
+                    ) * w2d[None, :, :]
+                    weight_sum[:, oy0:oy1, ox0:ox1] += w2d[None, :, :]
+
+                # Safe normalize. cupy's `divide` doesn't accept `where=`, and
+                # untouched pixels (weight=0) should stay 0; clamping the
+                # divisor to a tiny positive value gives 0/eps == 0 in the
+                # uint16 cast that follows.
+                safe_weight = cp.maximum(weight_sum, cp.float32(1e-30))
+                fused_block /= safe_weight
+
+                fused_host = cp.asnumpy(fused_block.astype(cp.uint16))
+                self.fused_ts[
+                    time_idx, :, z_level, block_y:by_end, block_x:bx_end
+                ].write(fused_host).result()
+
+                del fused_block, weight_sum
+        finally:
+            close()
+
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        gc.collect()
 
     # -------------------------------------------------------------------------
     # Multiscale pyramid
