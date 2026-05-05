@@ -1527,12 +1527,60 @@ class TileFusion:
     # Multiscale pyramid
     # -------------------------------------------------------------------------
 
+    def _multiscale_tcz_chunks(
+        self, in_h: int, in_w: int, dtype_size: int, T: int, C: int, Z: int
+    ) -> Tuple[int, int]:
+        """Pick (t_chunk, z_chunk) so a (t, C, z, in_h, in_w) slab fits in memory.
+
+        For the GPU ``block_mean`` path we budget against free VRAM scaled by
+        ``self._vram_fraction``; every other path stays on the CPU and budgets
+        against host RAM. Without this, long timelapses or thick stacks blow
+        out a single ``inp[:, :, :, in_y0:in_y1, in_x0:in_x1].read()`` because
+        the slab pulls *every* T and Z plane for the requested YX block.
+
+        We prefer to keep Z whole and chunk T (Z is usually small; T can be
+        thousands). Bytes-per-plane budgets ``3 × max(dtype, 4) × C × in_h ×
+        in_w`` to cover the input slab, the downsampled output, and any
+        float32 intermediates ``block_reduce`` allocates.
+        """
+        using_gpu_downsample = (
+            self.multiscale_downsample == "block_mean"
+            and utils.USING_GPU
+            and utils.cp is not None
+        )
+        if using_gpu_downsample:
+            free_bytes, _ = utils.cp.cuda.Device().mem_info
+            usable = int(free_bytes * self._vram_fraction)
+        else:
+            import psutil
+
+            usable = int(psutil.virtual_memory().available * 0.4)
+
+        bytes_per_plane = max(1, C * in_h * in_w * max(dtype_size, 4) * 3)
+        max_planes = max(1, usable // bytes_per_plane)
+
+        if Z <= max_planes:
+            t_chunk = max(1, max_planes // max(1, Z))
+            z_chunk = Z
+        else:
+            t_chunk = 1
+            z_chunk = max(1, max_planes)
+
+        return min(t_chunk, T), min(z_chunk, Z)
+
     def _create_multiscales(
         self,
         omezarr_path: Path,
         factors: Sequence[int] = (2, 4, 8),
     ) -> None:
-        """Build NGFF multiscales by downsampling Y/X iteratively (not Z or T)."""
+        """Build NGFF multiscales by downsampling Y/X iteratively (not Z or T).
+
+        Each scale level reads chunks of size ``(t_chunk, C, z_chunk, factor *
+        chunk_y, factor * chunk_x)`` from the previous scale, downsamples on
+        GPU (when ``multiscale_downsample='block_mean'`` and the GPU backend
+        is active) or CPU, and writes the result. ``t_chunk`` and ``z_chunk``
+        are sized from VRAM/RAM so long timelapses do not OOM.
+        """
         inp = None
         for idx, factor in enumerate(factors):
             out_path = omezarr_path / f"scale{idx + 1}" / "image"
@@ -1545,7 +1593,7 @@ class TileFusion:
 
             factor_to_use = factors[idx] // factors[idx - 1] if idx > 0 else factors[0]
             # 5D shape: (T, C, Z, Y, X)
-            _, _, _, Y, X = inp.shape
+            T, C, Z, Y, X = inp.shape
             new_y, new_x = Y // factor_to_use, X // factor_to_use
 
             chunk_y = min(1024, new_y)
@@ -1556,6 +1604,16 @@ class TileFusion:
 
             self._create_fused_tensorstore(output_path=out_path)
 
+            in_h_max = factor_to_use * chunk_y
+            in_w_max = factor_to_use * chunk_x
+            try:
+                dtype_size = inp.dtype.numpy_dtype.itemsize
+            except AttributeError:
+                dtype_size = np.dtype(str(inp.dtype)).itemsize
+            t_chunk, z_chunk = self._multiscale_tcz_chunks(
+                in_h_max, in_w_max, dtype_size, T, C, Z
+            )
+
             for y0 in trange(0, new_y, chunk_y, desc=f"scale{idx + 1}", leave=True):
                 by = min(chunk_y, new_y - y0)
                 in_y0 = y0 * factor_to_use
@@ -1565,23 +1623,39 @@ class TileFusion:
                     in_x0 = x0 * factor_to_use
                     in_x1 = min(X, (x0 + bx) * factor_to_use)
 
-                    # Read 5D slab: (T, C, Z, h, w)
-                    slab = inp[:, :, :, in_y0:in_y1, in_x0:in_x1].read().result()
-                    if self.multiscale_downsample == "stride":
-                        down = slab[..., ::factor_to_use, ::factor_to_use]
-                    else:
-                        xp = utils.xp
-                        arr = xp.asarray(slab)
-                        # Only downsample Y, X (last 2 dims)
-                        block = (1, 1, 1, factor_to_use, factor_to_use)
-                        down_arr = utils.block_reduce(arr, block_size=block, func=xp.mean)
-                        down = (
-                            utils.cp.asnumpy(down_arr)
-                            if utils.USING_GPU and utils.cp is not None
-                            else np.asarray(down_arr)
-                        )
-                    down = down.astype(slab.dtype, copy=False)
-                    self.fused_ts[:, :, :, y0 : y0 + by, x0 : x0 + bx].write(down).result()
+                    for t0 in range(0, T, t_chunk):
+                        t1 = min(t0 + t_chunk, T)
+                        for z0 in range(0, Z, z_chunk):
+                            z1 = min(z0 + z_chunk, Z)
+
+                            # Read 5D slab: (t_chunk, C, z_chunk, h, w)
+                            slab = inp[
+                                t0:t1, :, z0:z1, in_y0:in_y1, in_x0:in_x1
+                            ].read().result()
+                            if self.multiscale_downsample == "stride":
+                                down = slab[..., ::factor_to_use, ::factor_to_use]
+                            else:
+                                xp = utils.xp
+                                arr = xp.asarray(slab)
+                                # Only downsample Y, X (last 2 dims)
+                                block = (1, 1, 1, factor_to_use, factor_to_use)
+                                down_arr = utils.block_reduce(
+                                    arr, block_size=block, func=xp.mean
+                                )
+                                down = (
+                                    utils.cp.asnumpy(down_arr)
+                                    if utils.USING_GPU and utils.cp is not None
+                                    else np.asarray(down_arr)
+                                )
+                            down = down.astype(slab.dtype, copy=False)
+                            self.fused_ts[
+                                t0:t1, :, z0:z1, y0 : y0 + by, x0 : x0 + bx
+                            ].write(down).result()
+
+                    # Free GPU pool blocks between (y0, x0) blocks so peak VRAM
+                    # is bounded by one slab not the whole pyramid.
+                    if utils.USING_GPU and utils.cp is not None:
+                        utils.cp.get_default_memory_pool().free_all_blocks()
 
             write_scale_group_metadata(omezarr_path / f"scale{idx + 1}")
 
